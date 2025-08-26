@@ -1,12 +1,14 @@
-@description('Glavni Bicep template za web‑dev tečaj')
+@description('Glavni Bicep template za web-dev tečaj')
 param location string = resourceGroup().location
-param users array                                    // npr. [ { name:'marko.maric', role:'instruktor' }, ... ]
 param vmSize string = 'Standard_B1ms'
 param adminUsername string = 'azureuser'
 @secure()
 param adminPassword string
 param wordpressImage string = 'Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest'
 param tagCourse string = 'test'
+
+// Read users from local CSV (must be next to this bicep file)
+var usersCsv = loadTextContent('users.csv')
 
 /* ------------ globalna mreža i jump-host ------------ */
 
@@ -15,11 +17,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2022-05-01' = {
   location: location
   tags: { course: tagCourse }
   properties: {
-    addressSpace: {
-      addressPrefixes: [
-        '10.20.0.0/16'
-      ]
-    }
+    addressSpace: { addressPrefixes: [ '10.20.0.0/16' ] }
   }
 }
 
@@ -72,19 +70,13 @@ resource jumpNIC 'Microsoft.Network/networkInterfaces@2022-05-01' = {
       {
         name: 'ipconfig1'
         properties: {
-          subnet: {
-            id: jumpSubnet.id
-          }
+          subnet: { id: jumpSubnet.id }
           privateIPAllocationMethod: 'Dynamic'
-          publicIPAddress: {
-            id: jumpPublicIP.id
-          }
+          publicIPAddress: { id: jumpPublicIP.id }
         }
       }
     ]
-    networkSecurityGroup: {
-      id: jumpNSG.id
-    }
+    networkSecurityGroup: { id: jumpNSG.id }
   }
 }
 
@@ -93,19 +85,13 @@ resource jumpVM 'Microsoft.Compute/virtualMachines@2023-03-01' = {
   location: location
   tags: { course: tagCourse }
   properties: {
-    hardwareProfile: {
-      vmSize: vmSize
-    }
+    hardwareProfile: { vmSize: vmSize }
     osProfile: {
       computerName: 'jump-host'
       adminUsername: adminUsername
       adminPassword: adminPassword
     }
-    networkProfile: {
-      networkInterfaces: [
-        { id: jumpNIC.id }
-      ]
-    }
+    networkProfile: { networkInterfaces: [ { id: jumpNIC.id } ] }
     storageProfile: {
       imageReference: {
         publisher: 'Canonical'
@@ -113,66 +99,113 @@ resource jumpVM 'Microsoft.Compute/virtualMachines@2023-03-01' = {
         sku: '22_04-lts'
         version: 'latest'
       }
-      osDisk: {
-        createOption: 'FromImage'
-        name: 'jump-osdisk'
-      }
+      osDisk: { createOption: 'FromImage', name: 'jump-osdisk' }
     }
   }
 }
 
-/* ------------ per-user deployment ------------ */
+/* ------------ managed identity for deploymentScripts ------------ */
 
-var subnetPrefixBase = '10.20'
-var subnetIndex = 1
-
-resource userDeployments 'Microsoft.Resources/deploymentScripts@2019-10-01-preview' = [for (user, i) in users: {
-  name: 'deploy-${user.name}'
+resource dsUami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'ds-uami'
   location: location
-  kind: 'AzurePowerShell'
-  identity: {
-    type: 'UserAssigned'
-  }
+}
+
+var contributorRoleId = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  'b24988ac-6180-42a0-ab88-20f7382dd24c' // Contributor
+)
+
+resource dsUamiContrib 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, dsUami.name, contributorRoleId)
+  scope: resourceGroup()
   properties: {
-    azPowerShellVersion: '9.4'
-    scriptContent: '''
-param($subnet, $user, $location, $vmSize, $adminUsername, $adminPassword, $tagCourse, $imageReference)
-
-for ($j = 1; $j -le 4; $j++) {
-  $vmName = "$($user.name)-vm$j"
-
-  az vm create `
-    --name $vmName `
-    --resource-group $env:AZURE_RESOURCE_GROUP `
-    --image $imageReference `
-    --admin-username $adminUsername `
-    --admin-password $adminPassword `
-    --size $vmSize `
-    --subnet $subnet `
-    --public-ip-address "" `
-    --nsg "" `
-    --tags course=$tagCourse `
-    --output none
-
-  for ($k = 1; $k -le 2; $k++) {
-    $diskName = "$vmName-disk$k"
-    az disk create --name $diskName --size-gb 5 --resource-group $env:AZURE_RESOURCE_GROUP --tags course=$tagCourse --output none
-    az vm disk attach --name $diskName --vm-name $vmName --resource-group $env:AZURE_RESOURCE_GROUP --output none
+    roleDefinitionId: contributorRoleId
+    principalId: dsUami.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
-'''
-    arguments: format(
-      '-subnet "{0}.{1}" -user {2} -location {3} -vmSize {4} -adminUsername {5} -adminPassword {6} -tagCourse {7} -imageReference "{8}"',
-      subnetPrefixBase,
-      subnetIndex + i,
-      json(user),
-      location,
-      vmSize,
-      adminUsername,
-      adminPassword,
-      tagCourse,
-      wordpressImage
-    )
-    retentionInterval: 'P1D'
+
+/* ------------ users from CSV via a single deployment script ------------ */
+
+
+resource usersScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
+  name: 'deploy-users'
+  location: location
+  kind: 'AzureCLI'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${dsUami.id}': {}
+    }
   }
-}]
+  properties: {
+    azCliVersion: '2.75.0' // if deployment says "unsupported version", try '2.75.0' or '2.74.0'
+    scriptContent: '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Login with UAMI and select subscription
+az login --identity --output none
+if [[ -n "${SUBSCRIPTION_ID:-}" ]]; then
+  az account set --subscription "$SUBSCRIPTION_ID" --output none
+fi
+
+# Inputs from env
+SUBNET_ID="${SUBNET_ID}"
+LOCATION="${LOCATION}"
+VM_SIZE="${VM_SIZE}"
+ADMIN_USERNAME="${ADMIN_USERNAME}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD}"
+TAG_COURSE="${TAG_COURSE}"
+IMAGE_REFERENCE="${IMAGE_REFERENCE}"
+RESOURCE_GROUP="${RESOURCE_GROUP}"
+
+# Parse CSV (header: mail,role)
+echo "$USERS_CSV" | tail -n +2 | while IFS=',' read -r mail role; do
+  [[ -z "$mail" ]] && continue
+  name="${mail%@*}"
+
+  for j in 1 2 3 4; do
+    vmName="${name}-vm${j}"
+
+    az vm create \
+      --name "$vmName" \
+      --resource-group "$RESOURCE_GROUP" \
+      --image "$IMAGE_REFERENCE" \
+      --admin-username "$ADMIN_USERNAME" \
+      --admin-password "$ADMIN_PASSWORD" \
+      --size "$VM_SIZE" \
+      --subnet "$SUBNET_ID" \
+      --public-ip-address "" \
+      --nsg "" \
+      --tags "course=$TAG_COURSE" "owner=$mail" "role=$role" \
+      --only-show-errors --output none
+
+    for k in 1 2; do
+      diskName="${vmName}-disk${k}"
+      az disk create --name "$diskName" --size-gb 5 --resource-group "$RESOURCE_GROUP" \
+        --tags "course=$TAG_COURSE" "owner=$mail" "role=$role" --only-show-errors --output none
+      az vm disk attach --name "$diskName" --vm-name "$vmName" --resource-group "$RESOURCE_GROUP" \
+        --only-show-errors --output none
+    done
+  done
+done
+'''
+    environmentVariables: [
+      { name: 'USERS_CSV',       value: usersCsv }                // from loadTextContent('users.csv')
+      { name: 'SUBNET_ID',       value: jumpSubnet.id }
+      { name: 'LOCATION',        value: location }
+      { name: 'VM_SIZE',         value: vmSize }
+      { name: 'ADMIN_USERNAME',  value: adminUsername }
+      { name: 'ADMIN_PASSWORD',  secureValue: adminPassword }
+      { name: 'TAG_COURSE',      value: tagCourse }
+      { name: 'IMAGE_REFERENCE', value: wordpressImage }
+      { name: 'RESOURCE_GROUP',  value: resourceGroup().name }
+      { name: 'SUBSCRIPTION_ID', value: subscription().subscriptionId }
+    ]
+    retentionInterval: 'P1D'
+    cleanupPreference: 'OnSuccess'
+  }
+  dependsOn: [ dsUamiContrib ]
+}
