@@ -146,10 +146,17 @@ resource usersScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
 set -euo pipefail
 
 # Login with UAMI and select subscription
-az login --identity --output none
+az login --identity --allow-no-subscriptions --output none
 if [[ -n "${SUBSCRIPTION_ID:-}" ]]; then
-  az account set --subscription "$SUBSCRIPTION_ID" --output none
+  for i in {1..18}; do
+    if az account set --subscription "$SUBSCRIPTION_ID" --only-show-errors 2>/dev/null; then
+      break
+    fi
+    echo "Waiting for RBAC to propagate..."
+    sleep 10
+  done
 fi
+
 
 # Inputs from env
 SUBNET_ID="${SUBNET_ID}"
