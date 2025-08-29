@@ -1,4 +1,4 @@
-@description('Glavni Bicep template za web-dev tečaj')
+@description('main template')
 param location string = resourceGroup().location
 param vmSize string = 'Standard_B1ms'
 param adminUsername string = 'azureuser'
@@ -113,7 +113,7 @@ resource dsUami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = 
 
 var contributorRoleId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
-  'b24988ac-6180-42a0-ab88-20f7382dd24c' // Contributor
+  'b24988ac-6180-42a0-ab88-20f7382dd24c' 
 )
 
 resource dsUamiContrib 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -173,7 +173,7 @@ echo "$USERS_CSV" | tail -n +2 | while IFS=',' read -r mail role; do
   [[ -z "$mail" ]] && continue
   name="${mail%@*}"
 
-  for j in 1 2 3 4; do
+  for j in 1; do
     vmName="${name}-vm${j}"
 
     az vm create \
@@ -200,7 +200,7 @@ echo "$USERS_CSV" | tail -n +2 | while IFS=',' read -r mail role; do
 done
 '''
     environmentVariables: [
-      { name: 'USERS_CSV',       value: usersCsv }                // from loadTextContent('users.csv')
+      { name: 'USERS_CSV',       value: usersCsv }
       { name: 'SUBNET_ID',       value: jumpSubnet.id }
       { name: 'LOCATION',        value: location }
       { name: 'VM_SIZE',         value: vmSize }
