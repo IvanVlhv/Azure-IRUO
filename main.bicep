@@ -1,16 +1,19 @@
 @description('main template')
 param location string = resourceGroup().location
-param vmSize string = 'Standard_B1ms'
+param vmSize string = 'Standard_A1_v2'
 param adminUsername string = 'azureuser'
+param diskSku string = 'Standard_LRS'  
 @secure()
-param adminPassword string
+param adminPassword string = 'TempPass123!'   
 param wordpressImage string = 'Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest'
 param tagCourse string = 'test'
+@minValue(1)
+param perUserVmCount int = 1                 
 
-// Read users from local CSV (must be next to this bicep file)
+
 var usersCsv = loadTextContent('users.csv')
 
-/* ------------ globalna mreža i jump-host ------------ */
+//network
 
 resource vnet 'Microsoft.Network/virtualNetworks@2022-05-01' = {
   name: 'course-vnet'
@@ -104,7 +107,7 @@ resource jumpVM 'Microsoft.Compute/virtualMachines@2023-03-01' = {
   }
 }
 
-/* ------------ managed identity for deploymentScripts ------------ */
+//user assigned managed identity
 
 resource dsUami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'ds-uami'
@@ -126,9 +129,7 @@ resource dsUamiContrib 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-/* ------------ users from CSV via a single deployment script ------------ */
-
-
+// create users 
 resource usersScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
   name: 'deploy-users'
   location: location
@@ -140,13 +141,13 @@ resource usersScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
     }
   }
   properties: {
-    azCliVersion: '2.75.0' // if deployment says "unsupported version", try '2.75.0' or '2.74.0'
+    azCliVersion: '2.75.0'
     scriptContent: '''
 #!/usr/bin/env bash
 set -euo pipefail
 
 # Login with UAMI and select subscription
-az login --identity --allow-no-subscriptions --output none
+az login --identity --allow-no-subscriptions --only-show-errors --output none
 if [[ -n "${SUBSCRIPTION_ID:-}" ]]; then
   for i in {1..18}; do
     if az account set --subscription "$SUBSCRIPTION_ID" --only-show-errors 2>/dev/null; then
@@ -157,7 +158,6 @@ if [[ -n "${SUBSCRIPTION_ID:-}" ]]; then
   done
 fi
 
-
 # Inputs from env
 SUBNET_ID="${SUBNET_ID}"
 LOCATION="${LOCATION}"
@@ -167,18 +167,20 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD}"
 TAG_COURSE="${TAG_COURSE}"
 IMAGE_REFERENCE="${IMAGE_REFERENCE}"
 RESOURCE_GROUP="${RESOURCE_GROUP}"
+PER_USER_VM_COUNT="${PER_USER_VM_COUNT}"
 
 # Parse CSV (header: mail,role)
 echo "$USERS_CSV" | tail -n +2 | while IFS=',' read -r mail role; do
   [[ -z "$mail" ]] && continue
   name="${mail%@*}"
 
-  for j in 1; do
+  for j in $(seq 1 "${PER_USER_VM_COUNT}"); do
     vmName="${name}-vm${j}"
 
     az vm create \
       --name "$vmName" \
       --resource-group "$RESOURCE_GROUP" \
+      --location "$LOCATION" \
       --image "$IMAGE_REFERENCE" \
       --admin-username "$ADMIN_USERNAME" \
       --admin-password "$ADMIN_PASSWORD" \
@@ -186,30 +188,37 @@ echo "$USERS_CSV" | tail -n +2 | while IFS=',' read -r mail role; do
       --subnet "$SUBNET_ID" \
       --public-ip-address "" \
       --nsg "" \
+      --storage-sku "$DISK_SKU" \
       --tags "course=$TAG_COURSE" "owner=$mail" "role=$role" \
       --only-show-errors --output none
 
     for k in 1 2; do
       diskName="${vmName}-disk${k}"
       az disk create --name "$diskName" --size-gb 5 --resource-group "$RESOURCE_GROUP" \
+        --location "$LOCATION" \
+        --sku "$DISK_SKU" \
         --tags "course=$TAG_COURSE" "owner=$mail" "role=$role" --only-show-errors --output none
       az vm disk attach --name "$diskName" --vm-name "$vmName" --resource-group "$RESOURCE_GROUP" \
         --only-show-errors --output none
     done
+    # gentle throttle to be nice to quotas/rate limits
+    sleep 2
   done
 done
 '''
     environmentVariables: [
-      { name: 'USERS_CSV',       value: usersCsv }
-      { name: 'SUBNET_ID',       value: jumpSubnet.id }
-      { name: 'LOCATION',        value: location }
-      { name: 'VM_SIZE',         value: vmSize }
-      { name: 'ADMIN_USERNAME',  value: adminUsername }
-      { name: 'ADMIN_PASSWORD',  secureValue: adminPassword }
-      { name: 'TAG_COURSE',      value: tagCourse }
-      { name: 'IMAGE_REFERENCE', value: wordpressImage }
-      { name: 'RESOURCE_GROUP',  value: resourceGroup().name }
-      { name: 'SUBSCRIPTION_ID', value: subscription().subscriptionId }
+      { name: 'USERS_CSV',         value: usersCsv }
+      { name: 'SUBNET_ID',         value: jumpSubnet.id }
+      { name: 'LOCATION',          value: location }
+      { name: 'VM_SIZE',           value: vmSize }
+      { name: 'ADMIN_USERNAME',    value: adminUsername }
+      { name: 'ADMIN_PASSWORD',    secureValue: adminPassword }
+      { name: 'TAG_COURSE',        value: tagCourse }
+      { name: 'IMAGE_REFERENCE',   value: wordpressImage }
+      { name: 'RESOURCE_GROUP',    value: resourceGroup().name }
+      { name: 'SUBSCRIPTION_ID',   value: subscription().subscriptionId }
+      { name: 'PER_USER_VM_COUNT', value: string(perUserVmCount) }
+      { name: 'DISK_SKU',          value: diskSku }
     ]
     retentionInterval: 'P1D'
     cleanupPreference: 'OnSuccess'
