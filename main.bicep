@@ -2,7 +2,7 @@
 param location string = resourceGroup().location
 
 @description('Veličina VM-ova (1 vCPU/1GB: Standard_B1s)')
-param vmSize string = 'Standard_B1s'
+param vmSize string = 'Standard_A1_v2'
 
 @description('Veličina jump host-a')
 param jumpVmSize string = 'Standard_B1s'
