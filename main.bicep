@@ -11,7 +11,7 @@ param jumpVmSize string = 'Standard_B1s'
 param adminUsername string = 'azureuser'
 
 @secure()
-@description('Admin lozinka')
+@description('Admin lozinka (koristi se i kao zajednički "lab" pass za studentske OS accounte)')
 param adminPassword string
 
 @description('Ubuntu slika (22.04 LTS)')
@@ -21,11 +21,11 @@ param ubuntuImage string = 'Canonical:0001-com-ubuntu-server-jammy:22_04-lts:lat
 param tagCourse string = 'cloudlearn'
 
 @minValue(0)
-@description('BROJ instruktorskih VM-ova (3.2) — default 0 zbog kvote')
+@description('BROJ instruktorskih VM-ova — default 1 (može 0 zbog kvote)')
 param instructorVmCount int = 1
 
 @minValue(1)
-@description('BROJ WordPress VM-ova po studentu (3.2) — default 1 radi kvote')
+@description('BROJ WordPress VM-ova po studentu — default 1 radi kvote (podigni za HA)')
 param perUserVmCount int = 1
 
 @description('Ako false: odmah deallocate nove VM-ove (štedi vCPU kvotu)')
@@ -34,7 +34,7 @@ param powerOn bool = true
 @description('Opcionalno: GUID grupe INSTRUKTORA (Entra ID Object ID). Ako zadano, grupa dobiva VM Contributor na RG-u.')
 param instructorsGroupObjectId string = ''
 
-@description('Opcionalno: GUID grupe STUDENATA. Ako zadano, grupa dobiva VM Operator + Serial Console na SVE studentske VM-ove (kompromis za 3.4).')
+@description('Opcionalno: GUID grupe STUDENATA. Ako zadano, grupa dobiva VM Operator + Serial Console na SVE studentske VM-ove (kompromis dok nemaš per-user OID).')
 param studentsGroupObjectId string = ''
 
 @description('SKU dodatnih diskova')
@@ -42,7 +42,7 @@ param diskSku string = 'Standard_LRS'
 
 var usersCsv = loadTextContent('users.csv') // mail,role
 
-// ---------- HUB (instruktorska mreža + SHARED JUMP HOST) ----------
+// ---------- HUB (instruktorska mreža) ----------
 resource hubVnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   name: 'hub-vnet'
   location: location
@@ -58,30 +58,6 @@ resource hubVnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   }
 }
 
-// NSG za jump-host NIC (otvara SSH s Interneta SAMO za taj VM)
-resource jumpHostNsg 'Microsoft.Network/networkSecurityGroups@2022-05-01' = {
-  name: 'jump-host-nsg'
-  location: location
-  tags: { course: tagCourse }
-  properties: {
-    securityRules: [
-      {
-        name: 'Allow-SSH-Internet'
-        properties: {
-          access: 'Allow'
-          direction: 'Inbound'
-          priority: 100
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '22'
-          sourceAddressPrefix: '*'
-          destinationAddressPrefix: '*'
-        }
-      }
-    ]
-  }
-}
-
 // ---------- Managed Identity za skriptu ----------
 resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'deploy-uami'
@@ -91,9 +67,6 @@ resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
 
 var roleContributor   = subscriptionResourceId('Microsoft.Authorization/roleDefinitions','b24988ac-6180-42a0-ab88-20f7382dd24c')
 var roleUAA           = subscriptionResourceId('Microsoft.Authorization/roleDefinitions','18d7d88d-d35e-4fb5-a5c3-7773c20a72d9')
-var roleVmContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions','9980e02c-c2be-4d73-94e8-173b1dc7cf3c')
-var roleVmOperator    = subscriptionResourceId('Microsoft.Authorization/roleDefinitions','d5a91429-5739-47e2-a06b-3470a27159e7')
-var roleVmSerial      = subscriptionResourceId('Microsoft.Authorization/roleDefinitions','cdaa44e7-1d04-46b8-a2cd-97b88bdbd527')
 
 resource uamiContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(resourceGroup().id, uami.name, 'contrib')
@@ -146,13 +119,13 @@ resource deployAll 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
       { name: 'POWER_ON',                  value: powerOn ? 'true' : 'false' }
       { name: 'INSTRUCTORS_GROUP_OID',     value: instructorsGroupObjectId }
       { name: 'STUDENTS_GROUP_OID',        value: studentsGroupObjectId }
-      { name: 'JUMP_HOST_NSG_ID',          value: jumpHostNsg.id }
-      // Izbjegnemo hard-coded DNS suffix: koristimo environment().suffixes.storage
       { name: 'STORAGE_SUFFIX',            value: environment().suffixes.storage }
     ]
     scriptContent: '''
 #!/usr/bin/env bash
-set -euo pipefail
+# lab način: ne prekidaj sve na prvu grešku
+set -uo pipefail
+trap 'echo "[WARN] step failed at line ${LINENO}, continuing..."' ERR
 log(){ echo "[$(date -u +%H:%M:%S)] $*"; }
 
 az config set core.display_region_identified=false --only-show-errors 1>/dev/null || true
@@ -161,12 +134,17 @@ az account set --subscription "$SUBSCRIPTION_ID" --only-show-errors
 
 RG="$RESOURCE_GROUP"
 
+# ---------- helpers ----------
 safe() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-20; }
+# per-student CIDR plan: 10.91.<idx>.0/24 (VNet); app /25, jump /26
 addr_block(){ local i="$1"; echo "10.91.${i}.0/24"; }
 app_prefix(){ local i="$1"; echo "10.91.${i}.0/25"; }
+jump_prefix(){ local i="$1"; echo "10.91.${i}.128/26"; }
 
-write_cloud_init(){
-  local sa="$1" blobsas="$2" filesas="$3" out="$4"
+# cloud-init for WP node (mounts storage + installs WP + creates student OS account)
+# $1: storage account; $2: blob SAS (?..); $3: file SAS (?..); $4: student username; $5: output path
+write_wp_cloud_init(){
+  local sa="$1" blobsas="$2" filesas="$3" studuser="$4" out="$5"
   cat > "$out" <<'CLOUD'
 #cloud-config
 package_update: true
@@ -199,7 +177,10 @@ runcmd:
   - mkdir -p /mnt/objstore /mnt/afiles /var/www/html
   - sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
   - blobfuse2 mount /mnt/objstore --config-file=/etc/blobfuse2.yaml --allow-other || true
-  - mount -t cifs //__SA__.file.__STOR_SUFFIX__/files /mnt/afiles -o vers=3.0,username=AZURE\\__SA__,password=__FILE_SAS__,dir_mode=0775,file_mode=0664,serverino,nofail
+  - mount -t cifs //__SA__.file.__STOR_SUFFIX__/files /mnt/afiles -o vers=3.0,username=AZURE\__SA__,password=__FILE_SAS__,dir_mode=0775,file_mode=0664,serverino,nofail
+  - useradd -m __STUDUSER__ || true
+  - bash -lc 'echo "__STUDUSER__:__PASS__" | chpasswd'
+  - usermod -aG sudo __STUDUSER__ || true
   - curl -L https://wordpress.org/latest.tar.gz -o /tmp/wp.tgz
   - tar -xzf /tmp/wp.tgz -C /var/www/html --strip-components=1
   - mkdir -p /mnt/afiles/wp-content; rsync -a /var/www/html/wp-content/ /mnt/afiles/wp-content/ || true
@@ -215,95 +196,121 @@ CLOUD
   sed -i "s|__BLOB_SAS__|${blobsas}|g" "$out"
   sed -i "s|__FILE_SAS__|${filesas}|g" "$out"
   sed -i "s|__STOR_SUFFIX__|${STORAGE_SUFFIX}|g" "$out"
+  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
+  sed -i "s|__PASS__|${ADMIN_PASSWORD}|g" "$out"
 }
 
-# ---------- 1) KREIRAJ JEDAN JEDINI PUBLIC JUMP HOST U HUBU ----------
-log "Creating shared public jump host in hub..."
-az vm create -g "$RG" -n "jump-host" \
-  --image "$UBUNTU_IMAGE" --size "$JUMP_VM_SIZE" \
-  --admin-username "$ADMIN_USERNAME" --admin-password "$ADMIN_PASSWORD" \
-  --vnet-name "$(basename "$HUB_VNET_ID")" --subnet "instructor-subnet" \
-  --public-ip-address "jump-host-pip" --nsg "" \
-  --tags course="$TAG_COURSE" role="jump-host" --only-show-errors 1>/dev/null
+# cloud-init for JUMP host (create student OS account)
+# $1: student username; $2: output path
+write_jump_cloud_init(){
+  local studuser="$1" out="$2"
+  cat > "$out" <<'CLOUD'
+#cloud-config
+package_update: true
+packages: [ htop, tmux ]
+runcmd:
+  - useradd -m __STUDUSER__ || true
+  - bash -lc 'echo "__STUDUSER__:__PASS__" | chpasswd'
+  - usermod -aG sudo __STUDUSER__ || true
+CLOUD
+  sed -i "s|__STUDUSER__|${studuser}|g" "$out"
+  sed -i "s|__PASS__|${ADMIN_PASSWORD}|g" "$out"
+}
 
-# Pridruži NSG samo tom NIC-u (SSH s Interneta)
-nicId=$(az vm show -g "$RG" -n "jump-host" --query "networkProfile.networkInterfaces[0].id" -o tsv)
-nicName=$(basename "$nicId")
-az network nic update -g "$RG" -n "$nicName" --network-security-group "$JUMP_HOST_NSG_ID" --only-show-errors 1>/dev/null
-az vm boot-diagnostics enable -g "$RG" -n "jump-host" --only-show-errors 1>/dev/null
-[[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "jump-host" --only-show-errors 1>/dev/null || true
+# NSG rules builder for student subnets
+create_student_nsgs(){
+  local nsg_app="$1" nsg_jump="$2" jump_cidr="$3" instr_cidr="$4"
+  az network nsg create -g "$RG" -n "$nsg_app" --only-show-errors 1>/dev/null
+  az network nsg create -g "$RG" -n "$nsg_jump" --only-show-errors 1>/dev/null
+  # app subnet allow from jump & instructor (SSH/HTTP) + LB probe
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-SSH-From-Jump \
+    --priority 100 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes "$jump_cidr" --destination-port-ranges 22 --only-show-errors 1>/dev/null
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-HTTP-From-Jump \
+    --priority 110 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes "$jump_cidr" --destination-port-ranges 80 --only-show-errors 1>/dev/null
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-SSH-From-Instructor \
+    --priority 120 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes "$instr_cidr" --destination-port-ranges 22 --only-show-errors 1>/dev/null
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-HTTP-From-Instructor \
+    --priority 130 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes "$instr_cidr" --destination-port-ranges 80 --only-show-errors 1>/dev/null
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-AzureLB-Probe \
+    --priority 140 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes AzureLoadBalancer --destination-port-ranges '*' --only-show-errors 1>/dev/null
+  # jump subnet allow SSH from Internet
+  az network nsg rule create -g "$RG" --nsg-name "$nsg_jump" -n Allow-SSH-Internet \
+    --priority 100 --access Allow --protocol Tcp --direction Inbound \
+    --source-address-prefixes '*' --destination-port-ranges 22 --only-show-errors 1>/dev/null
+}
 
-# (Opcionalno) instruktorovi VM-ovi bez javnih IP-eva u istom subnetu (param 3.2)
+# ---------- 0) Instruktorski VM-ovi u HUB-u ----------
 if [[ "${INSTRUCTOR_VM_COUNT}" -gt 0 ]]; then
   for i in $(seq 1 "${INSTRUCTOR_VM_COUNT}"); do
-    az vm create -g "$RG" -n "instr-vm${i}" \
+    az vm create -g "$RG" -n "instructor-vm${i}" \
       --image "$UBUNTU_IMAGE" --size "$VM_SIZE" \
       --admin-username "$ADMIN_USERNAME" --admin-password "$ADMIN_PASSWORD" \
       --vnet-name "$(basename "$HUB_VNET_ID")" --subnet "instructor-subnet" \
       --public-ip-address "" --nsg "" --tags course="$TAG_COURSE" role="instructor" --only-show-errors 1>/dev/null
     for d in 1 2; do
-      az disk create -g "$RG" -n "instr-vm${i}-disk${d}" --size-gb 5 --sku "$DISK_SKU" --only-show-errors 1>/dev/null
-      az vm disk attach -g "$RG" --vm-name "instr-vm${i}" --name "instr-vm${i}-disk${d}" --only-show-errors 1>/dev/null
+      az disk create -g "$RG" -n "instructor-vm${i}-disk${d}" --size-gb 5 --sku "$DISK_SKU" --only-show-errors 1>/dev/null
+      az vm disk attach -g "$RG" --vm-name "instructor-vm${i}" --name "instructor-vm${i}-disk${d}" --only-show-errors 1>/dev/null
     done
-    az vm boot-diagnostics enable -g "$RG" -n "instr-vm${i}" --only-show-errors 1>/dev/null
-    [[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "instr-vm${i}" --only-show-errors 1>/dev/null || true
+    az vm boot-diagnostics enable -g "$RG" -n "instructor-vm${i}" --only-show-errors 1>/dev/null
+    [[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "instructor-vm${i}" --only-show-errors 1>/dev/null || true
   done
 fi
 
-# RBAC za INSTRUKTORSKU GRUPU (ako zadano) – bez Graph poziva
+# RBAC za INSTRUKTORSKU GRUPU (ako zadano) – bez Graph
 if [[ -n "${INSTRUCTORS_GROUP_OID:-}" ]]; then
   az role assignment create --assignee-object-id "$INSTRUCTORS_GROUP_OID" \
     --assignee-principal-type Group --role "Virtual Machine Contributor" \
     --scope "$(az group show -n "$RG" --query id -o tsv)" --only-show-errors 1>/dev/null || true
-else
-  log "WARN: No instructorsGroupObjectId provided; skipping instructor RBAC."
 fi
 
-# ---------- 2) STUDENTI: 1 VNET + N PRIVATNIH WP VM-ova (nema javnog IP-a) ----------
-# NSG pravila na APP subnet: dozvoli SSH/HTTP samo iz HUB instructor-subnet (gdje je jump-host)
-create_student_nsg(){
-  local nsg="$1" src="$2"
-  az network nsg create -g "$RG" -n "$nsg" --only-show-errors 1>/dev/null
-  az network nsg rule create -g "$RG" --nsg-name "$nsg" -n Allow-SSH-From-Hub \
-    --priority 100 --access Allow --protocol Tcp --direction Inbound \
-    --source-address-prefixes "$src" --destination-port-ranges 22 --only-show-errors 1>/dev/null
-  az network nsg rule create -g "$RG" --nsg-name "$nsg" -n Allow-HTTP-From-Hub \
-    --priority 110 --access Allow --protocol Tcp --direction Inbound \
-    --source-address-prefixes "$src" --destination-port-ranges 80 --only-show-errors 1>/dev/null
-}
-
+# ---------- 1) STUDENTI: VNet (jump+app), NAT, ILB, jump+WP VM-ovi ----------
 idx=1
 while IFS=',' read -r mail role; do
   [[ -z "${mail:-}" ]] && continue
   [[ "$mail" == "mail" ]] && continue  # preskoči header
-  [[ "$(echo "$role" | tr '[:upper:]' '[:lower:]')" != "student" ]] && continue
-  name="$(safe "${mail%@*}")"
+  role_lc="$(echo "$role" | tr '[:upper:]' '[:lower:]')"
+  [[ "$role_lc" != "student" ]] && continue
+
+  name="$(safe "${mail%@*}")"      # npr. jsabol2
+  studuser="stud_${name}"           # OS account na VM-ovima
 
   vnet="stu-${name}-vnet"
   appSubnet="app-subnet"
+  jumpSubnet="jump-subnet"
   nsgApp="stu-${name}-app-nsg"
+  nsgJump="stu-${name}-jump-nsg"
   natPip="stu-${name}-natpip"
   natGw="stu-${name}-nat"
+  lb="stu-${name}-ilb"; fe="fe"; be="be"
   sa="sa$(echo ${name} | tr -cd 'a-z0-9' | cut -c1-10)$(date +%H%M%S | tr -cd '0-9' | tail -c6)"; sa="${sa:0:23}"
 
   vnetCidr="$(addr_block $idx)"
   appCidr="$(app_prefix $idx)"
+  jumpCidr="$(jump_prefix $idx)"
   idx=$((idx+1))
 
-  log "Student $mail -> $name  VNet:$vnet ($vnetCidr) app:$appCidr"
+  log "Student $mail -> $name  VNet:$vnet ($vnetCidr) app:$appCidr jump:$jumpCidr"
 
-  # VNet + APP subnet
+  # VNet + subnets
   az network vnet create -g "$RG" -n "$vnet" --address-prefixes "$vnetCidr" \
     --subnet-name "$appSubnet" --subnet-prefixes "$appCidr" --only-show-errors 1>/dev/null
+  az network vnet subnet create -g "$RG" --vnet-name "$vnet" -n "$jumpSubnet" --address-prefixes "$jumpCidr" --only-show-errors 1>/dev/null
 
-  # NSG na APP subnet (dopušta samo iz HUB-a)
-  create_student_nsg "$nsgApp" "$HUB_INSTR_CIDR"
+  # NSG rules
+  create_student_nsgs "$nsgApp" "$nsgJump" "$jumpCidr" "$HUB_INSTR_CIDR"
   az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$appSubnet" --network-security-group "$nsgApp" --only-show-errors 1>/dev/null
+  az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$jumpSubnet" --network-security-group "$nsgJump" --only-show-errors 1>/dev/null
 
-  # NAT Gateway (izlaz na internet)
+  # NAT Gateway (egress) na oba subneta
   az network public-ip create -g "$RG" -n "$natPip" --sku Standard --allocation-method Static --only-show-errors 1>/dev/null
   az network nat gateway create -g "$RG" -n "$natGw" --public-ip-addresses "$natPip" --only-show-errors 1>/dev/null
-  az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$appSubnet" --nat-gateway "$natGw" --only-show-errors 1>/dev/null
+  az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$appSubnet"  --nat-gateway "$natGw" --only-show-errors 1>/dev/null
+  az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$jumpSubnet" --nat-gateway "$natGw" --only-show-errors 1>/dev/null
 
   # Storage (Blob+Files) + SAS
   az storage account create -g "$RG" -n "$sa" -l "$LOCATION" --sku Standard_LRS --kind StorageV2 \
@@ -315,10 +322,33 @@ while IFS=',' read -r mail role; do
   blobSas="$(az storage container generate-sas --account-name "$sa" --name obj --permissions rlw --expiry "$expiry" --https-only --account-key "$key" -o tsv)"
   fileSas="$(az storage share generate-sas --account-name "$sa" --name files --permissions rlw --expiry "$expiry" --https-only --account-key "$key" -o tsv)"
 
-  # N WordPress VM-ova (privatni) — 3.2
+  # Internal Load Balancer (privatni)
+  cidr_no_mask="${appCidr%/*}"
+  IFS='.' read -r o1 o2 o3 o4 <<< "$cidr_no_mask"
+  ILB_IP="${o1}.${o2}.${o3}.10"
+  az network lb create -g "$RG" -n "$lb" --sku Standard \
+    --vnet-name "$vnet" --subnet "$appSubnet" --frontend-ip-name "$fe" --backend-pool-name "$be" \
+    --private-ip-address "$ILB_IP" --only-show-errors 1>/dev/null
+  az network lb probe create -g "$RG" --lb-name "$lb" -n http --protocol tcp --port 80 --only-show-errors 1>/dev/null
+  az network lb rule create -g "$RG" --lb-name "$lb" -n http80 --protocol Tcp --frontend-port 80 --backend-port 80 \
+    --frontend-ip-name "$fe" --backend-pool-name "$be" --probe-name http --idle-timeout 4 --only-show-errors 1>/dev/null
+  beId=$(az network lb address-pool show -g "$RG" --lb-name "$lb" -n "$be" --query id -o tsv)
+
+  # Jump host (po studentu, jedini s javnim IP-om)
+  jci="/tmp/${name}-jump-init.yml"; write_jump_cloud_init "$studuser" "$jci"
+  az vm create -g "$RG" -n "jump-${name}" \
+    --image "$UBUNTU_IMAGE" --size "$JUMP_VM_SIZE" \
+    --admin-username "$ADMIN_USERNAME" --admin-password "$ADMIN_PASSWORD" \
+    --vnet-name "$vnet" --subnet "$jumpSubnet" \
+    --public-ip-address "jump-${name}-pip" --nsg "" --custom-data "$jci" \
+    --tags course="$TAG_COURSE" owner="$mail" role="student-jump" --only-show-errors 1>/dev/null
+  az vm boot-diagnostics enable -g "$RG" -n "jump-${name}" --only-show-errors 1>/dev/null
+  [[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "jump-${name}" --only-show-errors 1>/dev/null || true
+
+  # WP VM-ovi + diskovi + dodavanje u LB backend
   for j in $(seq 1 "${PER_USER_VM_COUNT}"); do
     vm="wp-${name}-${j}"
-    ci="/tmp/${name}-cloudinit-${j}.yml"; write_cloud_init "$sa" "?${blobSas}" "?${fileSas}" "$ci"
+    ci="/tmp/${name}-wp-${j}.yml"; write_wp_cloud_init "$sa" "?${blobSas}" "?${fileSas}" "$studuser" "$ci"
     az vm create -g "$RG" -n "$vm" \
       --image "$UBUNTU_IMAGE" --size "$VM_SIZE" \
       --admin-username "$ADMIN_USERNAME" --admin-password "$ADMIN_PASSWORD" \
@@ -330,16 +360,12 @@ while IFS=',' read -r mail role; do
       az vm disk attach -g "$RG" --vm-name "$vm" --name "${vm}-disk${d}" --only-show-errors 1>/dev/null
     done
     az vm boot-diagnostics enable -g "$RG" -n "$vm" --only-show-errors 1>/dev/null
-    [[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "$vm" --only-show-errors 1>/dev/null || true
 
-    # RBAC za STUDENTSKU GRUPU (ako zadano) – kompromis 3.4
-    if [[ -n "${STUDENTS_GROUP_OID:-}" ]]; then
-      vmId=$(az vm show -g "$RG" -n "$vm" --query id -o tsv)
-      az role assignment create --assignee-object-id "$STUDENTS_GROUP_OID" --assignee-principal-type Group \
-        --role "Virtual Machine Operator" --scope "$vmId" --only-show-errors 1>/dev/null || true
-      az role assignment create --assignee-object-id "$STUDENTS_GROUP_OID" --assignee-principal-type Group \
-        --role "Virtual Machine Serial Console Contributor" --scope "$vmId" --only-show-errors 1>/dev/null || true
-    fi
+    nicId=$(az vm show -g "$RG" -n "$vm" --query "networkProfile.networkInterfaces[0].id" -o tsv)
+    nicName=$(basename "$nicId")
+    az network nic ip-config address-pool add -g "$RG" --nic-name "$nicName" --ip-config-name "ipconfig1" --address-pool "$beId" --only-show-errors 1>/dev/null
+
+    [[ "$POWER_ON" != "true" ]] && az vm deallocate -g "$RG" -n "$vm" --only-show-errors 1>/dev/null || true
   done
 
   # Peering HUB <-> STUDENT
@@ -353,7 +379,9 @@ while IFS=',' read -r mail role; do
 done < <(echo "$USERS_CSV")
 
 log "Deployment done."
+
+exit 0
 '''
   }
-  dependsOn: [ hubVnet, uamiContributor, uamiUaa, jumpHostNsg ]
+  dependsOn: [ uamiContributor, uamiUaa ]
 }
