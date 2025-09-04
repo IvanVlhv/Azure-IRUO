@@ -148,43 +148,42 @@ write_wp_cloud_init(){
   cat > "$out" <<'CLOUD'
 #cloud-config
 package_update: true
-packages: [ nginx, php-fpm, php-xml, php-curl, php-zip, php-mbstring, php-gd, php-sqlite3, unzip, cifs-utils, blobfuse2, keyutils ]
+packages:
+  - nginx
+  - php-fpm
+  - php-xml
+  - php-curl
+  - php-zip
+  - php-mbstring
+  - php-gd
+  - php-sqlite3
+  - unzip
 write_files:
-  - path: /etc/fuse.conf
-    content: |
-      user_allow_other
-    append: true
   - path: /etc/nginx/sites-available/default
     content: |
       server {
         listen 80 default_server;
         listen [::]:80 default_server;
-        root /var/www/html; index index.php index.html index.htm; server_name _;
+        root /var/www/html;
+        index index.php index.html index.htm;
+        server_name _;
         location / { try_files $uri $uri/ /index.php?$args; }
-        location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/run/php/php-fpm.sock; }
-        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ { expires max; log_not_found off; }
+        location ~ \.php$ {
+          include snippets/fastcgi-php.conf;
+          fastcgi_pass unix:/run/php/php-fpm.sock;
+        }
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+          expires max; log_not_found off;
+        }
       }
-  - path: /etc/blobfuse2.yaml
-    content: |
-      logging: { type: syslog }
-      components: [ libfuse ]
-      containers:
-        - name: obj
-          account-name: __SA__
-          container: obj
-          sas: "__BLOB_SAS__"
 runcmd:
-  - mkdir -p /mnt/objstore /mnt/afiles /var/www/html
-  - sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-  - blobfuse2 mount /mnt/objstore --config-file=/etc/blobfuse2.yaml --allow-other || true
-  - mount -t cifs //__SA__.file.__STOR_SUFFIX__/files /mnt/afiles -o vers=3.0,username=AZURE\__SA__,password=__FILE_SAS__,dir_mode=0775,file_mode=0664,serverino,nofail
   - useradd -m __STUDUSER__ || true
   - bash -lc 'echo "__STUDUSER__:__PASS__" | chpasswd'
   - usermod -aG sudo __STUDUSER__ || true
+  - bash -lc 'PHP_SOCK=$(ls /run/php/php*-fpm.sock | head -n1 || echo /run/php/php8.1-fpm.sock); sed -ri "s#fastcgi_pass unix:.*fpm\.sock;#fastcgi_pass unix:${PHP_SOCK};#" /etc/nginx/sites-available/default'
   - curl -L https://wordpress.org/latest.tar.gz -o /tmp/wp.tgz
+  - mkdir -p /var/www/html
   - tar -xzf /tmp/wp.tgz -C /var/www/html --strip-components=1
-  - mkdir -p /mnt/afiles/wp-content; rsync -a /var/www/html/wp-content/ /mnt/afiles/wp-content/ || true
-  - rm -rf /var/www/html/wp-content && ln -s /mnt/afiles/wp-content /var/www/html/wp-content
   - curl -L https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip -o /tmp/sqlite.zip
   - unzip -o /tmp/sqlite.zip -d /var/www/html/wp-content/plugins
   - cp /var/www/html/wp-content/plugins/sqlite-database-integration/db.copy /var/www/html/wp-content/db.php
@@ -192,16 +191,11 @@ runcmd:
   - systemctl enable --now php*-fpm || systemctl enable --now php8.1-fpm || true
   - systemctl restart nginx
 CLOUD
-  sed -i "s/__SA__/${sa}/g" "$out"
-  sed -i "s|__BLOB_SAS__|${blobsas}|g" "$out"
-  sed -i "s|__FILE_SAS__|${filesas}|g" "$out"
-  sed -i "s|__STOR_SUFFIX__|${STORAGE_SUFFIX}|g" "$out"
+  # lab mode: bez storage mount-a, lokalni wp-content
   sed -i "s|__STUDUSER__|${studuser}|g" "$out"
   sed -i "s|__PASS__|${ADMIN_PASSWORD}|g" "$out"
 }
 
-# cloud-init for JUMP host (create student OS account)
-# $1: student username; $2: output path
 write_jump_cloud_init(){
   local studuser="$1" out="$2"
   cat > "$out" <<'CLOUD'
