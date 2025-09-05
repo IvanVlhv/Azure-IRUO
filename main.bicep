@@ -1,48 +1,48 @@
 @description('Lokacija resursa')
 param location string = resourceGroup().location
 
-@description('VM veličina (1 vCPU/1GB: Standard_B1s idealno)')
+@description('tip VM-a')
 param vmSize string = 'Standard_B1s'
 
-@description('Veličina jump hosta')
+@description('jump host tip VM-a')
 param jumpVmSize string = 'Standard_B1s'
 
 @description('Admin korisnik')
 param adminUsername string = 'azureuser'
 
 @secure()
-@description('Admin lozinka (koristi se i kao zajednički "lab" pass za studentske OS accounte)')
+@description('Admin lozinka (i za ostale račune lozinka)')
 param adminPassword string
 
-@description('Ubuntu slika (22.04 LTS)')
+@description('Ubuntu slika')
 param ubuntuImage string = 'Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest'
 
 @description('Tag tečaja')
-param tagCourse string = 'cloudlearn'
+param tagCourse string = 'test'
 
 @minValue(0)
-@description('BROJ instruktorskih VM-ova — default 1 (može 0 zbog kvote)')
+@description('Broj instruktorskih VM-ova')
 param instructorVmCount int = 1
 
 @minValue(1)
-@description('BROJ WordPress VM-ova po studentu — default 1 radi kvote (podigni za HA)')
+@description('Broj studentskih VM-ova')
 param perUserVmCount int = 1
 
-@description('Ako false: odmah deallocate nove VM-ove (štedi vCPU kvotu)')
+@description('Ako false pri deploy ugasi VM-ove')
 param powerOn bool = true
 
-@description('Opcionalno: GUID grupe INSTRUKTORA (Entra ID Object ID). Ako zadano, grupa dobiva VM Contributor na RG-u.')
+@description('Opcionalno: GUID grupe INSTRUKTORA')
 param instructorsGroupObjectId string = ''
 
-@description('Opcionalno: GUID grupe STUDENATA. Ako zadano, grupa dobiva VM Operator + Serial Console na SVE studentske VM-ove (kompromis dok nemaš per-user OID).')
+@description('GUID grupe STUDENATA')
 param studentsGroupObjectId string = ''
 
 @description('SKU dodatnih diskova')
 param diskSku string = 'Standard_LRS'
 
-var usersCsv = loadTextContent('users.csv') // mail,role
+var usersCsv = loadTextContent('users.csv') 
 
-// ---------- HUB (instruktorska mreža) ----------
+// HUB - instuktorska mreža
 resource hubVnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   name: 'hub-vnet'
   location: location
@@ -58,7 +58,7 @@ resource hubVnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   }
 }
 
-// ---------- Managed Identity za skriptu ----------
+//  Managed Identity 
 resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'deploy-uami'
   location: location
@@ -87,7 +87,7 @@ resource uamiUaa 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-// ---------- Glavna deployment skripta (Azure CLI) ----------
+// Glavna deployment skripta 
 resource deployAll 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
   name: 'course-deploy'
   location: location
@@ -123,7 +123,6 @@ resource deployAll 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
     ]
     scriptContent: '''
 #!/usr/bin/env bash
-# lab način: ne prekidaj sve na prvu grešku
 set -uo pipefail
 trap 'echo "[WARN] step failed at line ${LINENO}, continuing..."' ERR
 log(){ echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -134,14 +133,12 @@ az account set --subscription "$SUBSCRIPTION_ID" --only-show-errors
 
 RG="$RESOURCE_GROUP"
 
-# ---------- helpers ----------
+# helpers 
 safe() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-20; }
-# per-student CIDR plan: 10.91.<idx>.0/24 (VNet); app /25, jump /26
 addr_block(){ local i="$1"; echo "10.91.${i}.0/24"; }
 app_prefix(){ local i="$1"; echo "10.91.${i}.0/25"; }
 jump_prefix(){ local i="$1"; echo "10.91.${i}.128/26"; }
 
-# cloud-init for WP node (mounts storage + installs WP + creates student OS account)
 # $1: storage account; $2: blob SAS (?..); $3: file SAS (?..); $4: student username; $5: output path
 write_wp_cloud_init(){
   local sa="$1" blobsas="$2" filesas="$3" studuser="$4" out="$5"
@@ -211,12 +208,10 @@ CLOUD
   sed -i "s|__PASS__|${ADMIN_PASSWORD}|g" "$out"
 }
 
-# NSG rules builder for student subnets
 create_student_nsgs(){
   local nsg_app="$1" nsg_jump="$2" jump_cidr="$3" instr_cidr="$4"
   az network nsg create -g "$RG" -n "$nsg_app" --only-show-errors 1>/dev/null
   az network nsg create -g "$RG" -n "$nsg_jump" --only-show-errors 1>/dev/null
-  # app subnet allow from jump & instructor (SSH/HTTP) + LB probe
   az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-SSH-From-Jump \
     --priority 100 --access Allow --protocol Tcp --direction Inbound \
     --source-address-prefixes "$jump_cidr" --destination-port-ranges 22 --only-show-errors 1>/dev/null
@@ -232,13 +227,12 @@ create_student_nsgs(){
   az network nsg rule create -g "$RG" --nsg-name "$nsg_app" -n Allow-AzureLB-Probe \
     --priority 140 --access Allow --protocol Tcp --direction Inbound \
     --source-address-prefixes AzureLoadBalancer --destination-port-ranges '*' --only-show-errors 1>/dev/null
-  # jump subnet allow SSH from Internet
   az network nsg rule create -g "$RG" --nsg-name "$nsg_jump" -n Allow-SSH-Internet \
     --priority 100 --access Allow --protocol Tcp --direction Inbound \
     --source-address-prefixes '*' --destination-port-ranges 22 --only-show-errors 1>/dev/null
 }
 
-# ---------- 0) Instruktorski VM-ovi u HUB-u ----------
+# Instruktorski VM-ovi u HUB-u 
 if [[ "${INSTRUCTOR_VM_COUNT}" -gt 0 ]]; then
   for i in $(seq 1 "${INSTRUCTOR_VM_COUNT}"); do
     az vm create -g "$RG" -n "instructor-vm${i}" \
@@ -255,14 +249,13 @@ if [[ "${INSTRUCTOR_VM_COUNT}" -gt 0 ]]; then
   done
 fi
 
-# RBAC za INSTRUKTORSKU GRUPU (ako zadano) – bez Graph
+# RBAC za instruktorsku grupu
 if [[ -n "${INSTRUCTORS_GROUP_OID:-}" ]]; then
   az role assignment create --assignee-object-id "$INSTRUCTORS_GROUP_OID" \
     --assignee-principal-type Group --role "Virtual Machine Contributor" \
     --scope "$(az group show -n "$RG" --query id -o tsv)" --only-show-errors 1>/dev/null || true
 fi
 
-# ---------- 1) STUDENTI: VNet (jump+app), NAT, ILB, jump+WP VM-ovi ----------
 idx=1
 while IFS=',' read -r mail role; do
   [[ -z "${mail:-}" ]] && continue
@@ -290,12 +283,12 @@ while IFS=',' read -r mail role; do
 
   log "Student $mail -> $name  VNet:$vnet ($vnetCidr) app:$appCidr jump:$jumpCidr"
 
-  # VNet + subnets
+  # VNet + subneti
   az network vnet create -g "$RG" -n "$vnet" --address-prefixes "$vnetCidr" \
     --subnet-name "$appSubnet" --subnet-prefixes "$appCidr" --only-show-errors 1>/dev/null
   az network vnet subnet create -g "$RG" --vnet-name "$vnet" -n "$jumpSubnet" --address-prefixes "$jumpCidr" --only-show-errors 1>/dev/null
 
-  # NSG rules
+  # NSG pravila
   create_student_nsgs "$nsgApp" "$nsgJump" "$jumpCidr" "$HUB_INSTR_CIDR"
   az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$appSubnet" --network-security-group "$nsgApp" --only-show-errors 1>/dev/null
   az network vnet subnet update -g "$RG" --vnet-name "$vnet" -n "$jumpSubnet" --network-security-group "$nsgJump" --only-show-errors 1>/dev/null
